@@ -31,26 +31,48 @@ def save_attempts(attempts):
 
 attempts = load_attempts()
 
+def sanitize_name(name):
+    if not re.match(r'^[a-zA-Z\s-]+$', name):
+        logging.error(f"Invalid name attempt: {name}")
+        raise ValueError("Invalid name format (only letters, spaces, and hyphens allowed)")
+
 def validate_email(email):
     pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
     if not re.match(pattern, email):
         logging.error(f"Invalid email attempt: {email}")
         raise ValueError("Invalid email format")
 
-def encrypt_data(data, key):
-    cipher = AES.new(key, AES.MODE_EAX)
-    nonce = cipher.nonce
-    ciphertext, tag = cipher.encrypt_and_digest(data.encode('utf-8'))
-    return nonce + ciphertext + tag
+from encrypt_data import encrypt_data, decrypt_data
 
-def decrypt_data(encrypted_data, key):
-    if encrypted_data is None:
-        return None
-    nonce = encrypted_data[:16]
-    tag = encrypted_data[-16:]
-    ciphertext = encrypted_data[16:-16]
-    cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
-    return cipher.decrypt_and_verify(ciphertext, tag).decode('utf-8')
+def login(cursor, email, password):
+    # Rate limiting for login attempts
+    current_time = time()
+    attempts[email] = [t for t in attempts[email] if current_time - t < TIME_WINDOW]
+    if len(attempts[email]) >= MAX_ATTEMPTS:
+        print(f"Too many login attempts for {email}. Please wait.")
+        logging.warning(f"Rate limit exceeded for email: {email}")
+        save_attempts(attempts)
+        return False
+    attempts[email].append(current_time)
+    save_attempts(attempts)
+
+    # Verify credentials
+    cursor.execute("SELECT password FROM customers WHERE email = %s", (email,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        hashed = bytes(row[0])  # Convert memoryview to bytes
+        if bcrypt.checkpw(password.encode('utf-8'), hashed):
+            print("Login successful")
+            logging.info(f"Successful login for email: {email}")
+            return True
+        else:
+            print("Login failed: Incorrect password")
+            logging.warning(f"Failed login attempt for email: {email} - Incorrect password")
+            return False
+    else:
+        print("Login failed: Email not found")
+        logging.warning(f"Failed login attempt - Email not found: {email}")
+        return False
 
 try:
     key = bytes.fromhex(os.getenv("ENCRYPTION_KEY"))
@@ -64,56 +86,53 @@ try:
     )
     cursor = conn.cursor()
 
-    # Encrypt the email
-    email = "john@example.com"
-    validate_email(email)
-    encrypted_email = encrypt_data(email, key)
+    # Prompt for login
+    print("=== User Login ===")
+    email = input("Enter email: ")
+    validate_email(email)  # Validate email format
+    password = input("Enter password: ")
 
-    # Hash the password
-    password = "mypassword"
-    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-
-    # Insert into database, handle duplicate emails
-    try:
-        cursor.execute(
-            "INSERT INTO customers (name, email, encrypted_data, password) VALUES (%s, %s, %s, %s)",
-            ("John Doe", email, encrypted_email, hashed_password)
-        )
-    except psycopg2.errors.UniqueViolation:
-        print(f"Email {email} already exists")
-        conn.rollback()
+    # Attempt to log in
+    if login(cursor, email, password):
+        # If login is successful, display user data
+        cursor.execute("SELECT name, email, encrypted_data, password FROM customers WHERE email = %s", (email,))
+        row = cursor.fetchone()
+        if row:
+            name, email, encrypted, hashed = row
+            decrypted_email = decrypt_data(encrypted, key)
+            print(f"\nUser Data:")
+            print(f"Name: {name}, Email: {email}, Decrypted Email: {decrypted_email}")
+            print("Password verified successfully")
     else:
-        conn.commit()
+        print("Access denied.")
 
-    # Retrieve and decrypt
-    cursor.execute("SELECT name, email, encrypted_data, password FROM customers")
-    rows = cursor.fetchall()
-    for row in rows:
-        name, email, encrypted, hashed = row
-        decrypted_email = decrypt_data(encrypted, key)
-        print(f"Name: {name}, Email: {email}, Decrypted Email: {decrypted_email}")
+    # Optionally insert new user (for testing purposes)
+    print("\n=== Register New User ===")
+    insert_new = input("Would you like to register a new user? (y/n): ").lower()
+    if insert_new == 'y':
+        name = input("Enter name: ")
+        sanitize_name(name)
+        email = input("Enter email: ")
+        validate_email(email)
+        password = input("Enter password: ")
 
-        # Rate limiting for password verification
-        current_time = time()
-        attempts[email] = [t for t in attempts[email] if current_time - t < TIME_WINDOW]
-        if len(attempts[email]) >= MAX_ATTEMPTS:
-            print(f"Too many password attempts for {email}. Please wait.")
-            logging.warning(f"Rate limit exceeded for email: {email}")
-            save_attempts(attempts)
-            continue
-        attempts[email].append(current_time)
-        save_attempts(attempts)
+        encrypted_email = encrypt_data(email, key)
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
-        # Verify password
-        if hashed:
-            hashed_bytes = bytes(hashed)
-            if bcrypt.checkpw(password.encode('utf-8'), hashed_bytes):
-                print("Password verified successfully")
-            else:
-                print("Password verification failed")
-                logging.warning(f"Failed password attempt for email: {email}")
-        else:
-            print("No password set for this record")
+        try:
+            cursor.execute(
+                "INSERT INTO customers (name, email, encrypted_data, password) VALUES (%s, %s, %s, %s)",
+                (name, email, encrypted_email, hashed_password)
+            )
+            cursor.execute(
+                "INSERT INTO audit_log (operation, email) VALUES (%s, %s)",
+                ("INSERT", email)
+            )
+            conn.commit()
+            print("User registered successfully")
+        except psycopg2.errors.UniqueViolation:
+            print(f"Email {email} already exists")
+            conn.rollback()
 
 except Exception as e:
     print(f"Error: {e}")
