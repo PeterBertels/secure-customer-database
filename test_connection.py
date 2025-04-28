@@ -3,10 +3,15 @@ from Crypto.Cipher import AES
 import os
 import re
 import bcrypt
+import logging
+
+# Configure logging
+logging.basicConfig(filename='security.log', level=logging.INFO)
 
 def validate_email(email):
     pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
     if not re.match(pattern, email):
+        logging.error(f"Invalid email attempt: {email}")
         raise ValueError("Invalid email format")
 
 def encrypt_data(data, key):
@@ -45,12 +50,17 @@ try:
     password = "mypassword"
     hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
-    # Insert into database
-    cursor.execute(
-        "INSERT INTO customers (name, email, encrypted_data, password) VALUES (%s, %s, %s, %s)",
-        ("John Doe", email, encrypted_email, hashed_password)
-    )
-    conn.commit()
+    # Insert into database, handle duplicate emails
+    try:
+        cursor.execute(
+            "INSERT INTO customers (name, email, encrypted_data, password) VALUES (%s, %s, %s, %s)",
+            ("John Doe", email, encrypted_email, hashed_password)
+        )
+    except psycopg2.errors.UniqueViolation:
+        print(f"Email {email} already exists")
+        conn.rollback()
+    else:
+        conn.commit()
 
     # Retrieve and decrypt
     cursor.execute("SELECT name, email, encrypted_data, password FROM customers")
