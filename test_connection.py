@@ -4,9 +4,32 @@ import os
 import re
 import bcrypt
 import logging
+from collections import defaultdict
+from time import time
+import json
 
 # Configure logging
 logging.basicConfig(filename='security.log', level=logging.INFO)
+
+# Rate limiting setup
+MAX_ATTEMPTS = 5
+TIME_WINDOW = 60  # 60 seconds
+
+# Load attempts from file (if exists)
+def load_attempts():
+    try:
+        with open('attempts.json', 'r') as f:
+            data = json.load(f)
+            return defaultdict(list, {k: [float(t) for t in v] for k, v in data.items()})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return defaultdict(list)
+
+# Save attempts to file
+def save_attempts(attempts):
+    with open('attempts.json', 'w') as f:
+        json.dump({k: v for k, v in attempts.items()}, f)
+
+attempts = load_attempts()
 
 def validate_email(email):
     pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
@@ -69,11 +92,26 @@ try:
         name, email, encrypted, hashed = row
         decrypted_email = decrypt_data(encrypted, key)
         print(f"Name: {name}, Email: {email}, Decrypted Email: {decrypted_email}")
+
+        # Rate limiting for password verification
+        current_time = time()
+        attempts[email] = [t for t in attempts[email] if current_time - t < TIME_WINDOW]
+        if len(attempts[email]) >= MAX_ATTEMPTS:
+            print(f"Too many password attempts for {email}. Please wait.")
+            logging.warning(f"Rate limit exceeded for email: {email}")
+            save_attempts(attempts)
+            continue
+        attempts[email].append(current_time)
+        save_attempts(attempts)
+
         # Verify password
         if hashed:
-            hashed_bytes = bytes(hashed)  # Convert memoryview to bytes
+            hashed_bytes = bytes(hashed)
             if bcrypt.checkpw(password.encode('utf-8'), hashed_bytes):
                 print("Password verified successfully")
+            else:
+                print("Password verification failed")
+                logging.warning(f"Failed password attempt for email: {email}")
         else:
             print("No password set for this record")
 
