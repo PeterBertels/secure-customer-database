@@ -7,6 +7,7 @@ import logging
 from collections import defaultdict
 from time import time
 import json
+import csv
 
 # Configure logging
 logging.basicConfig(filename='security.log', level=logging.INFO)
@@ -120,6 +121,33 @@ def reset_password(cursor, conn, email):
     logging.info(f"Password reset for email: {email}")
     return True
 
+def update_user(cursor, conn, email, key):
+    cursor.execute("SELECT id FROM customers WHERE email = %s", (email,))
+    row = cursor.fetchone()
+    if not row:
+        print("User not found.")
+        return False
+
+    print("\n=== Update Profile ===")
+    new_name = input("Enter new name (leave blank to keep current): ")
+    if new_name:
+        sanitize_name(new_name)
+        encrypted_name = encrypt_data(new_name, key)
+        cursor.execute(
+            "UPDATE customers SET name = %s WHERE email = %s",
+            (encrypted_name, email)
+        )
+        cursor.execute(
+            "INSERT INTO audit_log (operation, email) VALUES (%s, %s)",
+            ("UPDATE_NAME", email)
+        )
+        conn.commit()
+        print("Profile updated successfully")
+        logging.info(f"Profile updated for email: {email}")
+    else:
+        print("No changes made.")
+    return True
+
 def view_all_users(cursor, key):
     cursor.execute("SELECT name, email, encrypted_data, role FROM customers")
     rows = cursor.fetchall()
@@ -132,6 +160,31 @@ def view_all_users(cursor, key):
         decrypted_name = decrypt_data(encrypted_name, key)
         decrypted_email = decrypt_data(encrypted_email, key)
         print(f"Name: {decrypted_name if decrypted_name else 'N/A'}, Email: {email}, Decrypted Email: {decrypted_email}, Role: {role}")
+
+def export_users(cursor, conn, key):
+    cursor.execute("SELECT name, email, encrypted_data, role FROM customers")
+    rows = cursor.fetchall()
+    if not rows:
+        print("No users to export.")
+        return
+
+    filename = f"users_export_{int(time())}.csv"
+    with open(filename, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Name', 'Email', 'Decrypted Email', 'Role'])
+        for row in rows:
+            encrypted_name, email, encrypted_email, role = row
+            decrypted_name = decrypt_data(encrypted_name, key) if encrypted_name else 'N/A'
+            decrypted_email = decrypt_data(encrypted_email, key) if encrypted_email else 'N/A'
+            writer.writerow([decrypted_name, email, decrypted_email, role])
+
+    cursor.execute(
+        "INSERT INTO audit_log (operation, email) VALUES (%s, %s)",
+        ("EXPORT_USERS", current_session["email"])
+    )
+    conn.commit()
+    print(f"Users exported successfully to {filename}")
+    logging.info(f"Users exported by {current_session['email']} to {filename}")
 
 def delete_user(cursor, conn, email):
     cursor.execute("SELECT id, role FROM customers WHERE email = %s", (email,))
@@ -182,14 +235,37 @@ try:
     # Main menu
     print("=== Secure Customer Database System ===")
     while True:
-        print("\nOptions:")
-        print("1. Login")
-        print("2. Reset Password")
-        print("3. Register New User")
-        print("4. Exit")
-        choice = input("Enter your choice (1-4): ")
+        # Dynamically build menu options
+        menu_options = [
+            ("Login", lambda: True),
+            ("Reset Password", lambda: True),
+            ("Register New User", lambda: True),
+            ("Update Profile", lambda: current_session["email"] and check_session()),
+            ("Exit", lambda: True)
+        ]
 
-        if choice == '1':
+        print("\nOptions:")
+        valid_choices = []
+        for idx, (option, condition) in enumerate(menu_options, 1):
+            if condition():
+                print(f"{len(valid_choices) + 1}. {option}")
+                valid_choices.append((idx, option))
+
+        choice = input(f"Enter your choice (1-{len(valid_choices)}): ")
+
+        # Map user choice to original menu option index
+        try:
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(valid_choices):
+                selected_idx = valid_choices[choice_idx][0]
+            else:
+                print("Invalid choice. Please try again.")
+                continue
+        except ValueError:
+            print("Invalid choice. Please try again.")
+            continue
+
+        if selected_idx == 1:  # Login
             print("\n=== User Login ===")
             email = input("Enter email: ")
             validate_email(email)
@@ -209,13 +285,13 @@ try:
             else:
                 print("Access denied.")
 
-        elif choice == '2':
+        elif selected_idx == 2:  # Reset Password
             print("\n=== Password Reset ===")
             email = input("Enter email: ")
             validate_email(email)
             reset_password(cursor, conn, email)
 
-        elif choice == '3':
+        elif selected_idx == 3:  # Register New User
             print("\n=== Register New User ===")
             name = input("Enter name: ")
             sanitize_name(name)
@@ -247,12 +323,13 @@ try:
                 print(f"Email {email} already exists")
                 conn.rollback()
 
-        elif choice == '4':
+        elif selected_idx == 4:  # Update Profile
+            if current_session["email"] and check_session():
+                update_user(cursor, conn, current_session["email"], key)
+
+        elif selected_idx == 5:  # Exit
             print("Exiting...")
             break
-
-        else:
-            print("Invalid choice. Please try again.")
 
         # Admin menu after login
         if current_session["email"] and check_session():
@@ -261,8 +338,9 @@ try:
                     print("\nAdmin Options:")
                     print("1. View All Users")
                     print("2. Delete User")
-                    print("3. Back to Main Menu")
-                    admin_choice = input("Enter your choice (1-3): ")
+                    print("3. Export Users")
+                    print("4. Back to Main Menu")
+                    admin_choice = input("Enter your choice (1-4): ")
                     if not check_session():
                         break
                     if admin_choice == '1':
@@ -272,6 +350,8 @@ try:
                         validate_email(email_to_delete)
                         delete_user(cursor, conn, email_to_delete)
                     elif admin_choice == '3':
+                        export_users(cursor, conn, key)
+                    elif admin_choice == '4':
                         break
                     else:
                         print("Invalid choice. Please try again.")
