@@ -16,6 +16,7 @@ logging.basicConfig(filename='security.log', level=logging.INFO)
 MAX_ATTEMPTS = 5
 TIME_WINDOW = 60  # 60 seconds
 SESSION_TIMEOUT = 300  # 5 minutes in seconds
+MAX_PASSWORD_HISTORY = 3  # Store last 3 passwords
 
 # Session state
 current_session = {
@@ -63,6 +64,62 @@ def validate_password(password):
     if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
         raise ValueError("Password must contain at least one special character")
 
+def check_password_history(cursor, user_id, new_password):
+    cursor.execute(
+        "SELECT password FROM password_history WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+        (user_id, MAX_PASSWORD_HISTORY)
+    )
+    history = cursor.fetchall()
+    for (hashed,) in history:
+        # Ensure hashed is bytes for bcrypt
+        hashed = bytes(hashed) if isinstance(hashed, memoryview) else hashed
+        if bcrypt.checkpw(new_password.encode('utf-8'), hashed):
+            raise ValueError("Password has been used before. Please choose a different password.")
+
+def store_password_history(cursor, conn, user_id, hashed_password):
+    # Ensure hashed_password is bytes
+    hashed_password = bytes(hashed_password) if isinstance(hashed_password, memoryview) else hashed_password
+    # Insert the new password into history and commit
+    cursor.execute(
+        "INSERT INTO password_history (user_id, password) VALUES (%s, %s) RETURNING id",
+        (user_id, hashed_password)
+    )
+    new_entry_id = cursor.fetchone()[0]
+    conn.commit()
+    # Count total entries before pruning
+    cursor.execute(
+        "SELECT COUNT(*) FROM password_history WHERE user_id = %s",
+        (user_id,)
+    )
+    total_entries = cursor.fetchone()[0]
+    logging.info(f"Total password history entries before pruning for user_id {user_id}: {total_entries}")
+    # Prune history to keep only the latest MAX_PASSWORD_HISTORY entries
+    cursor.execute(
+        """
+        DELETE FROM password_history
+        WHERE user_id = %s
+        AND id NOT IN (
+            SELECT id
+            FROM password_history
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        )
+        """,
+        (user_id, user_id, MAX_PASSWORD_HISTORY)
+    )
+    # Log the number of deleted rows
+    deleted_rows = cursor.rowcount
+    logging.info(f"Pruned {deleted_rows} old password history entries for user_id {user_id}")
+    # Count total entries after pruning
+    cursor.execute(
+        "SELECT COUNT(*) FROM password_history WHERE user_id = %s",
+        (user_id,)
+    )
+    total_entries_after = cursor.fetchone()[0]
+    logging.info(f"Total password history entries after pruning for user_id {user_id}: {total_entries_after}")
+    conn.commit()
+
 from encrypt_data import encrypt_data, decrypt_data
 
 def login(cursor, email, password):
@@ -80,7 +137,7 @@ def login(cursor, email, password):
     row = cursor.fetchone()
     if row and row[0]:
         hashed, role = row
-        hashed = bytes(hashed)
+        hashed = bytes(hashed) if isinstance(hashed, memoryview) else hashed
         if bcrypt.checkpw(password.encode('utf-8'), hashed):
             print("Login successful")
             logging.info(f"Successful login for email: {email}")
@@ -97,6 +154,17 @@ def login(cursor, email, password):
         logging.warning(f"Failed login attempt - Email not found: {email}")
         return False, None
 
+def logout():
+    if current_session["email"]:
+        email = current_session["email"]
+        current_session["email"] = None
+        current_session["role"] = None
+        current_session["last_activity"] = None
+        print("Logged out successfully.")
+        logging.info(f"User logged out: {email}")
+    else:
+        print("No user is currently logged in.")
+
 def reset_password(cursor, conn, email):
     cursor.execute("SELECT id FROM customers WHERE email = %s", (email,))
     row = cursor.fetchone()
@@ -105,13 +173,25 @@ def reset_password(cursor, conn, email):
         logging.warning(f"Password reset attempt - Email not found: {email}")
         return False
 
-    new_password = input("Enter new password: ")
-    validate_password(new_password)
+    user_id = row[0]
+    while True:
+        try:
+            new_password = input("Enter new password: ")
+            validate_password(new_password)
+            # Check password history
+            check_password_history(cursor, user_id, new_password)
+            break
+        except ValueError as e:
+            print(f"Error: {e}")
+            print("Please try again.")
+
     hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
     cursor.execute(
         "UPDATE customers SET password = %s WHERE email = %s",
         (hashed_password, email)
     )
+    # Store the new password in history
+    store_password_history(cursor, conn, user_id, hashed_password)
     cursor.execute(
         "INSERT INTO audit_log (operation, email) VALUES (%s, %s)",
         ("PASSWORD_RESET", email)
@@ -129,23 +209,30 @@ def update_user(cursor, conn, email, key):
         return False
 
     print("\n=== Update Profile ===")
-    new_name = input("Enter new name (leave blank to keep current): ")
-    if new_name:
-        sanitize_name(new_name)
-        encrypted_name = encrypt_data(new_name, key)
-        cursor.execute(
-            "UPDATE customers SET name = %s WHERE email = %s",
-            (encrypted_name, email)
-        )
-        cursor.execute(
-            "INSERT INTO audit_log (operation, email) VALUES (%s, %s)",
-            ("UPDATE_NAME", email)
-        )
-        conn.commit()
-        print("Profile updated successfully")
-        logging.info(f"Profile updated for email: {email}")
-    else:
-        print("No changes made.")
+    while True:
+        new_name = input("Enter new name (leave blank to keep current): ")
+        if not new_name:  # Allow empty input to skip
+            print("No changes made.")
+            return True
+        try:
+            sanitize_name(new_name)
+            break
+        except ValueError as e:
+            print(f"Error: {e}")
+            print("Please try again.")
+
+    encrypted_name = encrypt_data(new_name, key)
+    cursor.execute(
+        "UPDATE customers SET name = %s WHERE email = %s",
+        (encrypted_name, email)
+    )
+    cursor.execute(
+        "INSERT INTO audit_log (operation, email) VALUES (%s, %s)",
+        ("UPDATE_NAME", email)
+    )
+    conn.commit()
+    print("Profile updated successfully")
+    logging.info(f"Profile updated for email: {email}")
     return True
 
 def view_all_users(cursor, key):
@@ -241,6 +328,7 @@ try:
             ("Reset Password", lambda: True),
             ("Register New User", lambda: True),
             ("Update Profile", lambda: current_session["email"] and check_session()),
+            ("Logout", lambda: current_session["email"] and check_session()),
             ("Exit", lambda: True)
         ]
 
@@ -251,24 +339,31 @@ try:
                 print(f"{len(valid_choices) + 1}. {option}")
                 valid_choices.append((idx, option))
 
-        choice = input(f"Enter your choice (1-{len(valid_choices)}): ")
-
-        # Map user choice to original menu option index
-        try:
-            choice_idx = int(choice) - 1
-            if 0 <= choice_idx < len(valid_choices):
-                selected_idx = valid_choices[choice_idx][0]
-            else:
-                print("Invalid choice. Please try again.")
+        while True:
+            choice = input(f"Enter your choice (1-{len(valid_choices)}): ").strip()
+            if not choice:  # Handle empty input
+                print("Choice cannot be empty. Please try again.")
                 continue
-        except ValueError:
-            print("Invalid choice. Please try again.")
-            continue
+            try:
+                choice_idx = int(choice) - 1
+                if 0 <= choice_idx < len(valid_choices):
+                    selected_idx = valid_choices[choice_idx][0]
+                    break
+                else:
+                    print("Invalid choice. Please try again.")
+            except ValueError:
+                print("Invalid choice. Please try again.")
 
         if selected_idx == 1:  # Login
             print("\n=== User Login ===")
-            email = input("Enter email: ")
-            validate_email(email)
+            while True:
+                email = input("Enter email: ").strip()
+                try:
+                    validate_email(email)
+                    break
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    print("Please try again.")
             password = input("Enter password: ")
 
             success, role = login(cursor, email, password)
@@ -287,19 +382,43 @@ try:
 
         elif selected_idx == 2:  # Reset Password
             print("\n=== Password Reset ===")
-            email = input("Enter email: ")
-            validate_email(email)
+            while True:
+                email = input("Enter email: ").strip()
+                try:
+                    validate_email(email)
+                    break
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    print("Please try again.")
             reset_password(cursor, conn, email)
 
         elif selected_idx == 3:  # Register New User
             print("\n=== Register New User ===")
-            name = input("Enter name: ")
-            sanitize_name(name)
-            email = input("Enter email: ")
-            validate_email(email)
-            password = input("Enter password: ")
-            validate_password(password)
-            role = input("Enter role (user/admin, default is user): ").lower() or 'user'
+            while True:
+                name = input("Enter name: ").strip()
+                try:
+                    sanitize_name(name)
+                    break
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    print("Please try again.")
+            while True:
+                email = input("Enter email: ").strip()
+                try:
+                    validate_email(email)
+                    break
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    print("Please try again.")
+            while True:
+                password = input("Enter password: ").strip()
+                try:
+                    validate_password(password)
+                    break
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    print("Please try again.")
+            role = input("Enter role (user/admin, default is user): ").lower().strip() or 'user'
             if role not in ['user', 'admin']:
                 print("Invalid role. Defaulting to 'user'.")
                 role = 'user'
@@ -310,9 +429,12 @@ try:
 
             try:
                 cursor.execute(
-                    "INSERT INTO customers (name, email, encrypted_data, password, role) VALUES (%s, %s, %s, %s, %s)",
+                    "INSERT INTO customers (name, email, encrypted_data, password, role) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                     (encrypted_name, email, encrypted_email, hashed_password, role)
                 )
+                user_id = cursor.fetchone()[0]
+                # Store the initial password in history
+                store_password_history(cursor, conn, user_id, hashed_password)
                 cursor.execute(
                     "INSERT INTO audit_log (operation, email) VALUES (%s, %s)",
                     ("INSERT", email)
@@ -327,7 +449,11 @@ try:
             if current_session["email"] and check_session():
                 update_user(cursor, conn, current_session["email"], key)
 
-        elif selected_idx == 5:  # Exit
+        elif selected_idx == 5:  # Logout
+            if current_session["email"] and check_session():
+                logout()
+
+        elif selected_idx == 6:  # Exit
             print("Exiting...")
             break
 
@@ -340,21 +466,37 @@ try:
                     print("2. Delete User")
                     print("3. Export Users")
                     print("4. Back to Main Menu")
-                    admin_choice = input("Enter your choice (1-4): ")
+                    while True:
+                        admin_choice = input("Enter your choice (1-4): ").strip()
+                        if not admin_choice:
+                            print("Choice cannot be empty. Please try again.")
+                            continue
+                        try:
+                            admin_choice_idx = int(admin_choice)
+                            if 1 <= admin_choice_idx <= 4:
+                                break
+                            else:
+                                print("Invalid choice. Please try again.")
+                        except ValueError:
+                            print("Invalid choice. Please try again.")
                     if not check_session():
                         break
                     if admin_choice == '1':
                         view_all_users(cursor, key)
                     elif admin_choice == '2':
-                        email_to_delete = input("Enter email of user to delete: ")
-                        validate_email(email_to_delete)
+                        while True:
+                            email_to_delete = input("Enter email of user to delete: ").strip()
+                            try:
+                                validate_email(email_to_delete)
+                                break
+                            except ValueError as e:
+                                print(f"Error: {e}")
+                                print("Please try again.")
                         delete_user(cursor, conn, email_to_delete)
                     elif admin_choice == '3':
                         export_users(cursor, conn, key)
                     elif admin_choice == '4':
                         break
-                    else:
-                        print("Invalid choice. Please try again.")
 
 except Exception as e:
     print(f"Error: {e}")
