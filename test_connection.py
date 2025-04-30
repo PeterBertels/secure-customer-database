@@ -8,6 +8,7 @@ from collections import defaultdict
 from time import time
 import json
 import csv
+import random  # Added for 2FA code generation
 
 # Configure logging
 logging.basicConfig(filename='security.log', level=logging.INFO)
@@ -122,6 +123,34 @@ def store_password_history(cursor, conn, user_id, hashed_password):
 
 from encrypt_data import encrypt_data, decrypt_data
 
+def generate_2fa_code():
+    # Generate a 6-digit 2FA code
+    code = str(random.randint(100000, 999999))
+    return code
+
+def verify_2fa(email):
+    # Simulate sending a 2FA code via email by printing to console
+    code = generate_2fa_code()
+    print(f"[Simulated Email] Your 2FA code for {email} is: {code}")
+    logging.info(f"2FA code generated for {email}: {code}")
+    
+    # Prompt user to enter the code
+    attempts = 3
+    while attempts > 0:
+        user_code = input(f"Enter the 2FA code sent to {email} (Attempts left: {attempts}): ").strip()
+        if user_code == code:
+            print("2FA verification successful")
+            logging.info(f"2FA verification successful for {email}")
+            return True
+        else:
+            attempts -= 1
+            print("Invalid 2FA code. Please try again.")
+            logging.warning(f"Failed 2FA attempt for {email}")
+    
+    print("Too many failed 2FA attempts. Login aborted.")
+    logging.warning(f"2FA verification failed for {email} after max attempts")
+    return False
+
 def login(cursor, email, password):
     current_time = time()
     attempts[email] = [t for t in attempts[email] if current_time - t < TIME_WINDOW]
@@ -139,6 +168,9 @@ def login(cursor, email, password):
         hashed, role = row
         hashed = bytes(hashed) if isinstance(hashed, memoryview) else hashed
         if bcrypt.checkpw(password.encode('utf-8'), hashed):
+            # Add 2FA verification after password check
+            if not verify_2fa(email):
+                return False, None
             print("Login successful")
             logging.info(f"Successful login for email: {email}")
             current_session["email"] = email
@@ -202,6 +234,14 @@ def reset_password(cursor, conn, email):
     return True
 
 def update_user(cursor, conn, email, key):
+    # Redundant email validation for safety
+    try:
+        validate_email(email)
+    except ValueError as e:
+        print(f"Error: {e}")
+        logging.error(f"Invalid email in update_user: {email}")
+        return False
+
     cursor.execute("SELECT id FROM customers WHERE email = %s", (email,))
     row = cursor.fetchone()
     if not row:
@@ -274,6 +314,14 @@ def export_users(cursor, conn, key):
     logging.info(f"Users exported by {current_session['email']} to {filename}")
 
 def delete_user(cursor, conn, email):
+    # Validate email with retry loop
+    try:
+        validate_email(email)
+    except ValueError as e:
+        print(f"Error: {e}")
+        logging.error(f"Invalid email in delete_user: {email}")
+        return False
+
     cursor.execute("SELECT id, role FROM customers WHERE email = %s", (email,))
     row = cursor.fetchone()
     if not row:
@@ -484,15 +532,11 @@ try:
                     if admin_choice == '1':
                         view_all_users(cursor, key)
                     elif admin_choice == '2':
+                        print("\n=== Delete User ===")
                         while True:
                             email_to_delete = input("Enter email of user to delete: ").strip()
-                            try:
-                                validate_email(email_to_delete)
+                            if delete_user(cursor, conn, email_to_delete):
                                 break
-                            except ValueError as e:
-                                print(f"Error: {e}")
-                                print("Please try again.")
-                        delete_user(cursor, conn, email_to_delete)
                     elif admin_choice == '3':
                         export_users(cursor, conn, key)
                     elif admin_choice == '4':
