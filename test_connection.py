@@ -511,6 +511,31 @@ def delete_user(cursor, conn, email):
     logging.info(f"User deleted: {email}")
     return True
 
+def analyze_trends(cursor):
+    """
+    Analyze trends in the audit_log table, focusing on password reset frequency over time (admin only).
+
+    Args:
+        cursor: Database cursor for executing queries.
+    """
+    # Query to count password resets per day
+    query = """
+    SELECT DATE_TRUNC('day', timestamp) as day, COUNT(*) as reset_count
+    FROM audit_log
+    WHERE operation = 'PASSWORD_RESET'
+    GROUP BY DATE_TRUNC('day', timestamp)
+    ORDER BY day;
+    """
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    if not rows:
+        print("No password reset events found.")
+        return
+    print("\nPassword Reset Trends (Daily):")
+    for row in rows:
+        day, count = row
+        print(f"Date: {day.date()}, Password Resets: {count}")
+
 def check_session():
     """
     Check if the current session is active; timeout after SESSION_TIMEOUT.
@@ -704,16 +729,17 @@ try:
                     print("1. View All Users")
                     print("2. Delete User")
                     print("3. Export Users")
-                    print("4. Back to Main Menu")
+                    print("4. Analyze Trends")
+                    print("5. Back to Main Menu")
                     # Validate admin menu choice
                     while True:
-                        admin_choice = input("Enter your choice (1-4): ").strip()
+                        admin_choice = input("Enter your choice (1-5): ").strip()
                         if not admin_choice:
                             print("Choice cannot be empty. Please try again.")
                             continue
                         try:
                             admin_choice_idx = int(admin_choice)
-                            if 1 <= admin_choice_idx <= 4:
+                            if 1 <= admin_choice_idx <= 5:
                                 break
                             else:
                                 print("Invalid choice. Please try again.")
@@ -732,6 +758,8 @@ try:
                     elif admin_choice == '3':
                         export_users(cursor, conn, key)
                     elif admin_choice == '4':
+                        analyze_trends(cursor)
+                    elif admin_choice == '5':
                         break
 
 except Exception as e:
